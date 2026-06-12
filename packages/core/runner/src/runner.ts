@@ -133,15 +133,17 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         }
       }
     } catch (e: any) {
+      // Persist whatever the LLM streamed before the failure, plus every step already
+      // committed earlier this turn, so neither an abort nor a provider/network error
+      // discards the in-flight turn whole.
+      if (textAcc) assistantParts.push({ type: 'text', text: textAcc });
+      if (assistantParts.length > 0) {
+        session = appendMessage(session, createMessage({
+          role: 'assistant', content: assistantParts, traceId, providerName: config.provider,
+        }));
+      }
+      await store.set(session.id, session);
       if (signal.aborted) {
-        // Save whatever the LLM streamed before the abort hit.
-        if (textAcc) assistantParts.push({ type: 'text', text: textAcc });
-        if (assistantParts.length > 0) {
-          session = appendMessage(session, createMessage({
-            role: 'assistant', content: assistantParts, traceId, providerName: config.provider,
-          }));
-        }
-        await store.set(session.id, session);
         yield { type: 'aborted', reason: typeof signal.reason === 'string' ? signal.reason : 'user-abort', session, traceId };
         return;
       }
@@ -163,6 +165,11 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
         providerName: config.provider,
       });
       session = appendMessage(session, assistantMsg);
+      // Commit the assistant message (text + tool-call intent) before tools run, so a
+      // hard interruption during tool execution preserves what the model decided to do.
+      // The terminal no-tool message is committed by the final `store.set` below, so flush
+      // here only when tool execution — the vulnerable window — follows.
+      if (pendingCalls.length > 0) await store.set(session.id, session);
     }
 
     // No tool calls → done
@@ -248,10 +255,16 @@ export async function* runSession(opts: RunSessionOpts): AsyncIterable<PipelineE
     // Add tool results message, then loop for the next provider call.
     const toolMsg = createMessage({ role: 'tool', content: toolResults, traceId });
     session = appendMessage(session, toolMsg);
+    // Commit the results before the next provider call: an interruption while the model
+    // is producing the next step must not lose tool work already done.
+    await store.set(session.id, session);
   }
 
   // ── 4. Persist and finish ──────────────────────────────────────────────────
   // `react` fires post-commit, in pump (the queue owner) — not here.
+  // Each in-loop step already committed itself (assistant-with-tools before exec, tool
+  // results after); this final write commits the terminal no-tool message and any
+  // screen-hook mutation that produced no messages — so it is not a redundant re-write.
 
   await store.set(session.id, session);
 
