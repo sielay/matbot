@@ -7,9 +7,9 @@ type CacheControl = { type: 'ephemeral' };
 type AnthropicTextBlock        = { type: 'text';              text: string;           cache_control?: CacheControl };
 type AnthropicThinkingBlock    = { type: 'thinking';          thinking: string; signature: string };
 type AnthropicRedactedThinking = { type: 'redacted_thinking'; data: string };
-type AnthropicImageBlock       = { type: 'image';             source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } };
+type AnthropicImageBlock       = { type: 'image';             source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string }; cache_control?: CacheControl };
 type AnthropicToolUse          = { type: 'tool_use';          id: string; name: string; input: unknown };
-type AnthropicToolResult       = { type: 'tool_result';       tool_use_id: string; content: string; is_error?: boolean };
+type AnthropicToolResult       = { type: 'tool_result';       tool_use_id: string; content: string; is_error?: boolean; cache_control?: CacheControl };
 type AnthropicContent          = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicRedactedThinking | AnthropicImageBlock | AnthropicToolUse | AnthropicToolResult;
 
 export interface AnthropicMessage {
@@ -79,7 +79,12 @@ export function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
     if (content.length > 0) result.push({ role, content });
   }
 
-  // Cache the second-to-last user turn (stable across the next request)
+  // Cache the second-to-last user turn (stable across the next request). The breakpoint caches the
+  // whole prefix before it — tools, system, and all earlier messages — so the growing transcript is
+  // read from cache on the next call instead of re-billed. In an agentic tool loop the user turns are
+  // tool_result blocks, not text, so the cache_control must land on whatever the turn's last block is,
+  // not only on text — gating on `text` silently disabled caching for exactly the loop case that needs
+  // it most, leaving the entire transcript uncached every iteration.
   const userTurns = result.reduce<number[]>((acc, m, i) => {
     if (m.role === 'user') acc.push(i);
     return acc;
@@ -89,8 +94,10 @@ export function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
     const idx  = userTurns[userTurns.length - 2]!;
     const turn = result[idx]!;
     const last = turn.content[turn.content.length - 1];
-    if (last && last.type === 'text') {
-      (last as AnthropicTextBlock).cache_control = { type: 'ephemeral' };
+    // text | image | tool_result are the user-turn block types Anthropic accepts cache_control on
+    // (thinking/reasoning are elided above; file/document/audio are converted to text).
+    if (last && (last.type === 'text' || last.type === 'image' || last.type === 'tool_result')) {
+      last.cache_control = { type: 'ephemeral' };
     }
   }
 

@@ -12,8 +12,10 @@ export interface OAIMessage {
   name?:        string;
 }
 
+type CacheControl = { type: 'ephemeral' };
+
 type OAIContentPart =
-  | { type: 'text';      text: string }
+  | { type: 'text';      text: string; cache_control?: CacheControl }
   | { type: 'image_url'; image_url: { url: string } };
 
 interface OAIToolCall {
@@ -29,7 +31,7 @@ export interface OAIToolDef {
 
 // ── Message conversion ────────────────────────────────────────────────────────
 
-export function toOAIMessages(messages: Message[]): OAIMessage[] {
+export function toOAIMessages(messages: Message[], opts?: { promptCaching?: boolean }): OAIMessage[] {
   const result: OAIMessage[] = [];
 
   for (const msg of messages) {
@@ -111,7 +113,40 @@ export function toOAIMessages(messages: Message[]): OAIMessage[] {
     result.push(oaiMsg);
   }
 
+  // Prompt caching (opt-in): OpenAI/DeepSeek cache prefixes automatically, but OpenRouter requires
+  // explicit `cache_control` breakpoints to cache Anthropic/Gemini models — without them every call
+  // re-bills the full prompt. Only emit when the provider config opts in (`parameters.promptCaching`),
+  // since strict OpenAI-compatible endpoints can reject the unknown field. Mark the system prompt and
+  // the second-to-last user turn (mirrors the Anthropic adapter): the breakpoint caches the prefix
+  // before it, so the growing transcript reads from cache instead of re-billing each turn.
+  if (opts?.promptCaching) {
+    for (const m of result) {
+      if (m.role === 'system') { markCacheBreakpoint(m); break; }
+    }
+    const userIdx = result.reduce<number[]>((acc, m, i) => {
+      if (m.role === 'user') acc.push(i);
+      return acc;
+    }, []);
+    if (userIdx.length >= 2) markCacheBreakpoint(result[userIdx[userIdx.length - 2]!]!);
+  }
+
   return result;
+}
+
+// Attach an ephemeral cache breakpoint to a message's last text part, converting plain-string content
+// to the array form `cache_control` requires. No-op for messages with no textual content (e.g. an
+// assistant turn that is only tool_calls) — there is nothing to anchor the breakpoint to.
+function markCacheBreakpoint(msg: OAIMessage): void {
+  if (typeof msg.content === 'string') {
+    if (msg.content.length === 0) return;
+    msg.content = [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }];
+    return;
+  }
+  if (!Array.isArray(msg.content)) return;
+  for (let i = msg.content.length - 1; i >= 0; i--) {
+    const part = msg.content[i]!;
+    if (part.type === 'text') { part.cache_control = { type: 'ephemeral' }; return; }
+  }
 }
 
 export function toOAITools(tools: readonly Tool[]): OAIToolDef[] {

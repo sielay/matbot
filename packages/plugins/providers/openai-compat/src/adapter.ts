@@ -64,7 +64,7 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     const body: Record<string, unknown> = {
       model:    config.model,
       [tokenLimitParam(config)]: config.parameters?.maxTokens ?? DEFAULT_MAX_TOKENS,
-      messages:       toOAIMessages(messages),
+      messages:       toOAIMessages(messages, { promptCaching: config.parameters?.['promptCaching'] === true }),
       stream:         true,
       stream_options: { include_usage: true },
     };
